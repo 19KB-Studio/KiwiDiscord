@@ -15,10 +15,18 @@ NOTIFY_WINDOW = (7, 10)  # days-out range for a first notification
 class CTFTracker(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
-        self.check_ctf_events.start()
+        if db.DATABASE_URL:
+            self.check_ctf_events.start()
+        else:
+            print(
+                "[CTF] DATABASE_URL is not set — CTF tracker background checks "
+                "are disabled. $setctfchannel and $ctfupcoming that touch the "
+                "DB will also fail until it's configured."
+            )
 
     def cog_unload(self):
-        self.check_ctf_events.cancel()
+        if self.check_ctf_events.is_running():
+            self.check_ctf_events.cancel()
 
     # ── Scheduled check ───────────────────────────────────────────────────
 
@@ -38,7 +46,12 @@ class CTFTracker(commands.Cog):
         # One connection for the whole run: upsert, two reads, one batched
         # write. This replaces what was previously up to (events × guilds)
         # separate connections.
-        conn = await db.connect()
+        try:
+            conn = await db.connect()
+        except RuntimeError as e:
+            print(f"[CTF] Skipping this run — {e}")
+            return
+
         try:
             await db.upsert_events(conn, events)
 
@@ -96,7 +109,11 @@ class CTFTracker(commands.Cog):
         Usage: $setctfchannel [yes|no]   (yes/no = also notify offline India events)
         """
         notify_india = offline_india.lower() not in ("no", "false", "off")
-        await db.set_ctf_channel(ctx.guild.id, ctx.channel.id, notify_india)
+        try:
+            await db.set_ctf_channel(ctx.guild.id, ctx.channel.id, notify_india)
+        except RuntimeError:
+            await ctx.send("❌ CTF tracker isn't configured yet (`DATABASE_URL` is not set). Ask the bot owner to set it up.")
+            return
         await ctx.send(
             f"✅ CTF notifications will be posted in {ctx.channel.mention}. "
             f"Offline India events: {'included' if notify_india else 'excluded'}."
