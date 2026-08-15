@@ -1,3 +1,4 @@
+# ctf.py
 import datetime
 
 import discord
@@ -10,6 +11,8 @@ import formatting
 
 CHECK_INTERVAL_HOURS = 6
 NOTIFY_WINDOW = (7, 10)  # days-out range for a first notification
+UPCOMING_WINDOW_DAYS = 10  # for $ctfupcoming: 0 (starts later today) through this many days out
+MAX_EMBEDS_PER_MESSAGE = 10  # Discord hard cap per message
 
 
 class CTFTracker(commands.Cog):
@@ -43,9 +46,6 @@ class CTFTracker(commands.Cog):
             and (filters.is_open_online(e) or filters.is_offline_india(e))
         ]
 
-        # One connection for the whole run: upsert, two reads, one batched
-        # write. This replaces what was previously up to (events × guilds)
-        # separate connections.
         try:
             conn = await db.connect()
         except RuntimeError as e:
@@ -121,24 +121,39 @@ class CTFTracker(commands.Cog):
 
     @commands.command(name="ctfupcoming")
     async def ctf_upcoming(self, ctx: commands.Context):
-        """List upcoming CTFs matching your filters, regardless of the notify window."""
+        """
+        List live and upcoming CTFs matching your filters: open-to-anyone
+        online events, plus offline events happening in India. "Upcoming"
+        covers the next 10 days; live events (already started, not yet
+        finished) are shown first regardless of when they started.
+        """
         events = await ctftime_client.fetch_upcoming_events()
         now = datetime.datetime.now(datetime.timezone.utc)
 
-        matches = [
-            e for e in events
-            if (filters.is_open_online(e) or filters.is_offline_india(e))
-            and filters.days_until_start(e, now) >= 0
-        ]
-        matches.sort(key=lambda e: e["start_time"])
+        live = []
+        upcoming = []  # (event, days_out)
+        for e in events:
+            if not (filters.is_open_online(e) or filters.is_offline_india(e)):
+                continue
+            if filters.is_live(e, now):
+                live.append(e)
+                continue
+            days_out = filters.days_until_start(e, now)
+            if 0 <= days_out <= UPCOMING_WINDOW_DAYS:
+                upcoming.append((e, days_out))
 
-        if not matches:
-            await ctx.send("No matching upcoming CTFs found right now.")
+        if not live and not upcoming:
+            await ctx.send(f"No live CTFs and nothing matching in the next {UPCOMING_WINDOW_DAYS} days right now.")
             return
 
-        for event in matches[:5]:
-            days_out = filters.days_until_start(event, now)
-            await ctx.send(embed=formatting.build_event_embed(event, days_out))
+        live.sort(key=lambda e: e["finish_time"])
+        upcoming.sort(key=lambda pair: pair[0]["start_time"])
+
+        embeds = [formatting.build_event_embed(e, 0, live=True) for e in live]
+        embeds += [formatting.build_event_embed(e, days_out) for e, days_out in upcoming]
+
+        for i in range(0, len(embeds), MAX_EMBEDS_PER_MESSAGE):
+            await ctx.send(embeds=embeds[i:i + MAX_EMBEDS_PER_MESSAGE])
 
 
 async def setup(bot: commands.Bot):
