@@ -1,3 +1,4 @@
+# filters.py
 """
 Two independent filters, per your scoping — do not merge these into one
 function, they answer different questions:
@@ -38,3 +39,10 @@ def is_offline_india(event: dict) -> bool:
 def days_until_start(event, now) -> int:
     delta = event["start_time"] - now
     return delta.days
+
+
+def is_live(event: dict, now) -> bool:
+    """True if the event has started but not yet finished."""
+    return event["start_time"] <= now <= event["finish_time"]
+
+
