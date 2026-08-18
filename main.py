@@ -28,9 +28,9 @@ bot = commands.Bot(
 @bot.event
 async def on_ready():
     logger.info(f"Logged in as {bot.user} (ID: {bot.user.id})")
-    print(f"✅ Logged in as {bot.user}")
-    print(f"GROQ KEY loaded: {bool(os.getenv('GROQ_API_KEY'))}")
-    print(f"GEMINI KEY loaded: {bool(os.getenv('GEMINI_API_KEY'))}")
+    print(f"Logged in as {bot.user}")
+    print(f"OPENROUTER KEY loaded: {bool(os.getenv('OPENROUTER_API_KEY'))}")
+    print(f"TAVILY KEY loaded: {bool(os.getenv('TAVILY_API_KEY'))}")
 
 
 async def load_cogs():
@@ -38,9 +38,9 @@ async def load_cogs():
     for cog in cogs:
         try:
             await bot.load_extension(cog)
-            print(f"✅ Loaded cog: {cog}")
+            print(f"Loaded cog: {cog}")
         except Exception as e:
-            print(f"❌ Failed to load cog {cog}: {e}")
+            print(f"Failed to load cog {cog}: {e}")
 
 
 async def main():

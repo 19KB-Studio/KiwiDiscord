@@ -1,36 +1,40 @@
-import discord
-from discord.ext import commands
-from groq import Groq
-from google import genai
 import asyncio
 import os
 
-GROQ_API_KEY   = os.getenv("GROQ_API_KEY")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+import discord
+from discord.ext import commands
+import aiohttp
 
-# Clients are created lazily (on first use) instead of at import time.
-# Groq(api_key=None) raises immediately, which would otherwise crash this
-# entire module's import — and with it every command in this cog, including
-# Gemini — whenever GROQ_API_KEY isn't set.
-_groq_client = None
-_gemini_client = None
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
+OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 
+# openrouter/free is OpenRouter's own router: it picks a currently-live free
+# model per request instead of you pinning to one specific model ID. This is
+# the actual fix for the failure mode that broke $groq and $gemini -- those
+# were hardcoded to specific models that got deprecated out from under them.
+# Docs: https://openrouter.ai/docs/guides/routing/routers/free-router
+OPENROUTER_MODEL = "openrouter/free"
 
-def get_groq_client() -> Groq | None:
-    global _groq_client
-    if _groq_client is None and GROQ_API_KEY:
-        _groq_client = Groq(api_key=GROQ_API_KEY)
-    return _groq_client
+# OpenRouter asks integrations to identify themselves via these headers --
+# not auth, just good citizenship, same idea as CTFtime's User-Agent requirement.
+OPENROUTER_HEADERS = {
+    "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+    "Content-Type": "application/json",
+    "HTTP-Referer": "https://github.com/19KB-Studio/KiwiDiscord",
+    "X-Title": "kiwiBot",
+}
 
-
-def get_gemini_client() -> genai.Client | None:
-    global _gemini_client
-    if _gemini_client is None and GEMINI_API_KEY:
-        _gemini_client = genai.Client(api_key=GEMINI_API_KEY)
-    return _gemini_client
+# ── Web search grounding (Tavily) ─────────────────────────────────────────────
+# Free tier: 1,000 credits/month, no card required, 1 credit per basic search.
+# Docs: https://docs.tavily.com
+TAVILY_API_KEY = os.getenv("TAVILY_API_KEY")
+TAVILY_URL = "https://api.tavily.com/search"
+TAVILY_MAX_RESULTS = 4
+TAVILY_SNIPPET_CHARS = 300  # per-result content cap, keeps the prompt small
 
 SYSTEM_PROMPT = """
-You are an intelligent AI assistant integrated into a Discord server.
+You are an intelligent AI assistant integrated into a Discord server, with
+access to live web search results provided alongside each question.
 
 Your purpose is to assist users across multiple types of conversations including
 technical discussions, general questions, entertainment, and updates about global
@@ -43,6 +47,12 @@ Core Responsibilities:
 3. Participate in general conversation when users ask casual questions.
 4. Provide summaries of important global technology trends when asked.
 5. Keep responses suitable for Discord chat.
+6. When web search results are provided below a question, prioritize them for
+   anything time-sensitive -- current events, recent CVEs/vulnerabilities,
+   version numbers, prices, or "latest" anything -- over your own training
+   knowledge, since search results are current and your training data is not.
+   If the search results don't cover the question, answer from your own
+   knowledge and say so rather than guessing at what the results might contain.
 
 Response Guidelines:
 - Keep responses concise.
@@ -52,7 +62,9 @@ Response Guidelines:
 
 Safety Rules:
 - Do not assist with harmful or illegal activities.
-- Only provide educational explanations for hacking/security topics.
+- Only provide educational explanations for hacking/security topics -- explain
+  how a vulnerability class works or how to defend against it, not
+  step-by-step exploitation instructions against real, unnamed targets.
 - Avoid misinformation.
 
 Interaction Style:
@@ -84,56 +96,91 @@ def get_chat(server: str, channel: str) -> list:
     return conversation_context.get(server, {}).get(channel, [])
 
 
-# ── API helpers with retry + timeout ─────────────────────────────────────────
+# ── Web search helper ─────────────────────────────────────────────────────────
 
-async def query_groq(messages: list) -> str | None:
-    client = get_groq_client()
-    if client is None:
-        print("[Groq] GROQ_API_KEY is not set — skipping request.")
+async def search_web(query: str) -> list[dict] | None:
+    """
+    Run a Tavily search and return up to TAVILY_MAX_RESULTS results as
+    [{"title", "url", "content"}, ...]. Returns None (not []) on any failure
+    or missing key so callers can distinguish "no search happened" from
+    "search happened but found nothing".
+    """
+    if not TAVILY_API_KEY:
         return None
+
+    payload = {
+        "api_key": TAVILY_API_KEY,
+        "query": query,
+        "search_depth": "basic",
+        "max_results": TAVILY_MAX_RESULTS,
+    }
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                TAVILY_URL, json=payload, timeout=aiohttp.ClientTimeout(total=15)
+            ) as resp:
+                if resp.status != 200:
+                    body = await resp.text()
+                    print(f"[Tavily] Unexpected status {resp.status}: {body[:300]}")
+                    return None
+                data = await resp.json()
+    except Exception as e:
+        print(f"[Tavily] Search failed: {e}")
+        return None
+
+    results = []
+    for item in data.get("results", [])[:TAVILY_MAX_RESULTS]:
+        content = (item.get("content") or "").strip()
+        if len(content) > TAVILY_SNIPPET_CHARS:
+            content = content[:TAVILY_SNIPPET_CHARS].rstrip() + "…"
+        results.append({
+            "title":   item.get("title", "Untitled"),
+            "url":     item.get("url", ""),
+            "content": content,
+        })
+    return results
+
+
+def format_search_context(results: list[dict]) -> str:
+    lines = ["Live web search results:"]
+    for i, r in enumerate(results, start=1):
+        lines.append(f"[{i}] {r['title']}\n{r['content']}\nSource: {r['url']}")
+    return "\n\n".join(lines)
+
+
+# ── OpenRouter helper with retry + timeout ───────────────────────────────────
+
+async def query_openrouter(messages: list) -> str | None:
+    if not OPENROUTER_API_KEY:
+        print("[OpenRouter] OPENROUTER_API_KEY is not set — skipping request.")
+        return None
+
+    payload = {"model": OPENROUTER_MODEL, "messages": messages}
 
     for attempt in range(1, MAX_RETRIES + 1):
         try:
-            response = await asyncio.wait_for(
-                asyncio.to_thread(
-                    client.chat.completions.create,
-                    model="llama3-8b-8192",
-                    messages=messages,
-                    timeout=API_TIMEOUT,
-                ),
-                timeout=API_TIMEOUT + 5,   # outer asyncio guard
-            )
-            return response.choices[0].message.content
+            async with aiohttp.ClientSession(headers=OPENROUTER_HEADERS) as session:
+                async with session.post(
+                    OPENROUTER_URL,
+                    json=payload,
+                    timeout=aiohttp.ClientTimeout(total=API_TIMEOUT),
+                ) as resp:
+                    if resp.status == 429:
+                        # Daily free-tier cap (50/day, 1000/day with any credit
+                        # balance) -- retrying immediately won't help this one.
+                        print("[OpenRouter] Rate limited — likely the daily free-tier cap.")
+                        return None
+                    if resp.status != 200:
+                        body = await resp.text()
+                        print(f"[OpenRouter] Unexpected status {resp.status}: {body[:300]}")
+                    else:
+                        data = await resp.json()
+                        return data["choices"][0]["message"]["content"]
         except asyncio.TimeoutError:
-            print(f"[Groq] Timeout on attempt {attempt}/{MAX_RETRIES}")
+            print(f"[OpenRouter] Timeout on attempt {attempt}/{MAX_RETRIES}")
         except Exception as e:
-            print(f"[Groq] Error on attempt {attempt}/{MAX_RETRIES}: {e}")
-        if attempt < MAX_RETRIES:
-            await asyncio.sleep(RETRY_DELAY)
-    return None
-
-
-async def query_gemini(question: str) -> str | None:
-    client = get_gemini_client()
-    if client is None:
-        print("[Gemini] GEMINI_API_KEY is not set — skipping request.")
-        return None
-
-    for attempt in range(1, MAX_RETRIES + 1):
-        try:
-            response = await asyncio.wait_for(
-                asyncio.to_thread(
-                    client.models.generate_content,
-                    model="gemini-2.0-flash",
-                    contents=question,
-                ),
-                timeout=API_TIMEOUT + 5,
-            )
-            return response.text
-        except asyncio.TimeoutError:
-            print(f"[Gemini] Timeout on attempt {attempt}/{MAX_RETRIES}")
-        except Exception as e:
-            print(f"[Gemini] Error on attempt {attempt}/{MAX_RETRIES}: {e}")
+            print(f"[OpenRouter] Error on attempt {attempt}/{MAX_RETRIES}: {e}")
         if attempt < MAX_RETRIES:
             await asyncio.sleep(RETRY_DELAY)
     return None
@@ -145,56 +192,66 @@ async def send_chunked(destination, text: str):
         await destination.send(text[i:i + 2000])
 
 
+# ── Shared answer pipeline (search -> augmented prompt -> model) ─────────────
+
+async def answer_question(server: str, channel: str, question: str) -> tuple[str | None, list[dict] | None]:
+    """
+    Runs the full search-augmented answer flow for one question and returns
+    (answer_text, search_results). search_results is None if no search ran
+    (missing key or failure) -- distinct from an empty list.
+    """
+    search_results = await search_web(question)
+
+    store_chat(server, channel, question, "user")
+    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+
+    if search_results:
+        messages.append({"role": "system", "content": format_search_context(search_results)})
+
+    messages += get_chat(server, channel)
+
+    content = await query_openrouter(messages)
+    if content is not None:
+        store_chat(server, channel, content, "assistant")
+
+    return content, search_results
+
+
+def append_sources(text: str, search_results: list[dict] | None) -> str:
+    if not search_results:
+        return text
+    sources = "\n".join(f"[{i}] <{r['url']}>" for i, r in enumerate(search_results, start=1) if r["url"])
+    if not sources:
+        return text
+    return f"{text}\n\n**Sources:**\n{sources}"
+
+
 # ── Cog ───────────────────────────────────────────────────────────────────────
 
 class AI(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
 
-    # ── $groq ─────────────────────────────────────────────────────────────────
+    # ── $ai ───────────────────────────────────────────────────────────────────
 
-    @commands.command(name="groq")
-    async def ask_groq(self, ctx: commands.Context, *, question: str):
-        """Ask Groq (Llama 3) a question. Usage: $groq <question>"""
+    @commands.command(name="ai", aliases=["ask"])
+    async def ask_ai(self, ctx: commands.Context, *, question: str):
+        """Ask the AI a question (with live web search). Usage: $ai <question> (or $ask)"""
         server  = str(ctx.guild.id)
         channel = str(ctx.channel.id)
-        store_chat(server, channel, question, "user")
-        messages = [{"role": "system", "content": SYSTEM_PROMPT}] + get_chat(server, channel)
 
         async with ctx.channel.typing():
-            content = await query_groq(messages)
+            content, search_results = await answer_question(server, channel, question)
 
         if content is None:
             await ctx.send(
-                "⚠️ Groq didn't respond after retries. "
-                "This may be a rate-limit or a Render cold-start — please try again in a moment."
+                "⚠️o response after retries. This is usually the free-tier "
+                "daily rate limit (resets daily) or a temporary provider issue — "
+                "please try again in a bit."
             )
             return
 
-        store_chat(server, channel, content, "assistant")
-        await send_chunked(ctx, f"🟠 **Groq (Llama 3):**\n{content}")
-
-    # ── $gemini ───────────────────────────────────────────────────────────────
-
-    @commands.command(name="gemini")
-    async def ask_gemini(self, ctx: commands.Context, *, question: str):
-        """Ask Gemini a question. Usage: $gemini <question>"""
-        server  = str(ctx.guild.id)
-        channel = str(ctx.channel.id)
-        store_chat(server, channel, question, "user")
-
-        async with ctx.channel.typing():
-            content = await query_gemini(question)
-
-        if content is None:
-            await ctx.send(
-                "⚠️ Gemini didn't respond after retries. "
-                "This may be a rate-limit or a Render cold-start — please try again in a moment."
-            )
-            return
-
-        store_chat(server, channel, content, "assistant")
-        await send_chunked(ctx, f"🔵 **Gemini 2.0 Flash:**\n{content}")
+        await send_chunked(ctx, append_sources(f"🤖 **AI:**\n{content}", search_results))
 
     # ── $clear_context ────────────────────────────────────────────────────────
 
@@ -205,7 +262,7 @@ class AI(commands.Cog):
         channel = str(ctx.channel.id)
         if server in conversation_context and channel in conversation_context[server]:
             conversation_context[server][channel] = []
-        await ctx.send("🧹 Conversation context cleared for this channel.")
+        await ctx.send("Conversation context cleared for this channel.")
 
     # ── mention handler ───────────────────────────────────────────────────────
 
@@ -224,25 +281,21 @@ class AI(commands.Cog):
         content_clean = message.content.replace(f"<@{self.bot.user.id}>", "").strip()
         if not content_clean:
             await message.channel.send(
-                "Hey! How can I help? Try `$groq` or `$gemini` with a question."
+                "Hey! How can I help? Try `$ai` with a question."
             )
             return
 
-        store_chat(server, channel, content_clean, "user")
-        messages = [{"role": "system", "content": SYSTEM_PROMPT}] + get_chat(server, channel)
-
         async with message.channel.typing():
-            response_content = await query_groq(messages)
+            response_content, search_results = await answer_question(server, channel, content_clean)
 
         if response_content is None:
             await message.channel.send(
-                "⚠️ AI error occurred (timeout/rate-limit). Try again in a moment."
+                "⚠️I error occurred (timeout/rate-limit). Try again in a moment."
             )
             return
 
-        store_chat(server, channel, response_content, "assistant")
-        await send_chunked(message.channel, response_content)
+        await send_chunked(message.channel, append_sources(response_content, search_results))
 
 
 async def setup(bot: commands.Bot):
-    await bot.add_cog(AI(bot)) 
+    await bot.add_cog(AI(bot))
