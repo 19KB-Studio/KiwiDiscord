@@ -245,7 +245,7 @@ class AI(commands.Cog):
 
         if content is None:
             await ctx.send(
-                "⚠️o response after retries. This is usually the free-tier "
+                "⚠️No response after retries. This is usually the free-tier "
                 "daily rate limit (resets daily) or a temporary provider issue — "
                 "please try again in a bit."
             )
