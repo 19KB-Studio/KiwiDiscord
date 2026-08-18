@@ -3,7 +3,7 @@ A Discord bot that keeps your community updated with daily AI, tech, and cyberse
 ## File Structure
 ```
 main.py          — Entry point, loads all cogs
-ai.py            — Groq/Gemini chat commands ($groq, $gemini, $clear_context)
+ai.py            — Openrouter and Tavily for web search ($ask)
 crypto.py        — Encoding/decoding/hashing/RSA ($encode, $decode, $hash, $rsa*)
 updates.py       — Daily tech/AI/cybersecurity news ($news, $setnewschannel)
 moderation.py    — Nicknames, channel management, roleplay ($nick, $rp, $lock, ...)
