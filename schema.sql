@@ -33,3 +33,15 @@ CREATE TABLE IF NOT EXISTS ctf_channels (
 );
 
 CREATE INDEX IF NOT EXISTS idx_ctf_events_start_time ON ctf_events (start_time);
+
+-- One row per headline (keyed by md5 of the lowercased title) once it has
+-- appeared in a scheduled daily news digest. Used only by the scheduled
+-- digest in updates.py to stop the same article from repeating day over day
+-- when a slow-updating RSS feed doesn't rotate its "latest" entries between
+-- runs. $news (on-demand) intentionally does not check or write this table.
+CREATE TABLE IF NOT EXISTS news_sent (
+    title_hash      TEXT PRIMARY KEY,
+    first_seen      TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_news_sent_first_seen ON news_sent (first_seen);

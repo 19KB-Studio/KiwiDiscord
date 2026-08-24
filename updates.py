@@ -1,5 +1,7 @@
 import asyncio
+import calendar
 import datetime
+import hashlib
 import json
 import os
 
@@ -7,6 +9,8 @@ import discord
 from discord.ext import commands, tasks
 import aiohttp
 import feedparser
+
+import db
 
 
 # Target post time: 17:30 IST = 12:00 UTC
@@ -29,19 +33,39 @@ TECH_SOURCES = [
     "https://www.theverge.com/rss/index.xml",                # AI policy, big tech
     "https://feeds.feedburner.com/mitsmarterbusiness",       # MIT Technology Review
     "https://www.zdnet.com/news/rss.xml",                    # enterprise IT, security
+    "https://www.engadget.com/rss.xml",                      # broad tech, catches breaking
+                                                               # stories (leaks, DMCA fights, etc.)
+                                                               # general outlets otherwise miss
+    "https://www.bleepingcomputer.com/feed/",                 # dedicated infosec — breaches, CVEs,
+                                                               # malware; higher signal than
+                                                               # general-tech coverage of security
 ]
 
-# How many entries to pull per source
-ENTRIES_PER_SOURCE = 8
+# How many raw entries to pull per source BEFORE freshness filtering. Kept wide
+# so a source that front-loads older evergreen content doesn't crowd out fresh
+# items that would otherwise sit just past a smaller slice.
+RAW_FETCH_LIMIT = 20
+
+# Drop anything older than this — prevents a slow-updating feed from serving
+# the same "latest" articles run after run. Applies to both the scheduled
+# digest and $news.
+FRESHNESS_WINDOW_HOURS = 48
 
 # Max articles shown per category in the digest
-MAX_PER_CATEGORY = 6
+MAX_PER_CATEGORY = 10
+
+# How many days to remember a headline as "already sent" for the scheduled
+# daily digest. Only needs to be a bit longer than FRESHNESS_WINDOW_HOURS so
+# an article can't loop back in once it's aged past the freshness cutoff and
+# get pulled again as if new.
+NEWS_HISTORY_DAYS = 7
 
 CATEGORIES = {
     "ai":            ["artificial intelligence", "machine learning", "llm", "openai",
                       "anthropic", "deepmind", "generative", "chatgpt", "gemini", "gpt"],
-    "cybersecurity": ["hack", "malware", "vulnerability", "breach", "ransomware",
-                      "phishing", "zero-day", "exploit", "cve", "cyber", "security flaw"],
+    "cybersecurity": ["hack", "hacked", "malware", "vulnerability", "breach", "data breach",
+                      "ransomware", "phishing", "zero-day", "exploit", "cve", "cyber",
+                      "security flaw", "leak", "leaked"],
     "tech":          ["technology", "startup", "software", "hardware", "cloud",
                       "semiconductor", "chip", "apple", "google", "microsoft", "meta"],
 }
@@ -61,7 +85,7 @@ MAX_EMBEDS_PER_MESSAGE      = 10
 MAX_EMBED_CHARS_PER_MESSAGE = 5900
 
 
-# ── Persistence helpers ───────────────────────────────────────────────────────
+# ── Persistence helpers (per-guild channel config) ─────────────────────────────
 
 def load_news_channels() -> dict[str, int]:
     if not os.path.exists(NEWS_CHANNELS_FILE):
@@ -102,6 +126,72 @@ def channels_to_env_string(data: dict[str, int]) -> str:
     return ",".join(f"{gid}:{cid}" for gid, cid in data.items())
 
 
+# ── Cross-day dedup (Neon) ──────────────────────────────────────────────────────
+# Only used for the scheduled daily digest — see news_cmd for why $news is
+# intentionally excluded from this filter.
+
+def _title_hash(title: str) -> str:
+    return hashlib.md5(title.strip().lower().encode("utf-8")).hexdigest()
+
+
+async def filter_unsent(items: list[dict]) -> list[dict]:
+    """Drop items whose title was already posted in a recent digest. If the DB
+    isn't configured or the check fails, fail open and return items unchanged —
+    a missing dedup check is better than a broken digest."""
+    if not db.DATABASE_URL or not items:
+        return items
+
+    hashes = [_title_hash(i["title"]) for i in items]
+    try:
+        conn = await db.connect()
+    except RuntimeError:
+        return items
+
+    try:
+        rows = await conn.fetch(
+            "SELECT title_hash FROM news_sent WHERE title_hash = ANY($1::text[])",
+            hashes,
+        )
+        already_sent = {r["title_hash"] for r in rows}
+    except Exception as e:
+        print(f"[News] Failed to check news_sent, showing unfiltered: {e}")
+        return items
+    finally:
+        await conn.close()
+
+    return [item for item, h in zip(items, hashes) if h not in already_sent]
+
+
+async def mark_sent(items: list[dict]) -> None:
+    """Record headlines actually shown in a digest so they aren't repeated.
+    Also prunes entries older than NEWS_HISTORY_DAYS on the same connection."""
+    if not db.DATABASE_URL or not items:
+        return
+
+    rows = [(_title_hash(i["title"]),) for i in items]
+    try:
+        conn = await db.connect()
+    except RuntimeError:
+        return
+
+    try:
+        await conn.executemany(
+            """
+            INSERT INTO news_sent (title_hash, first_seen)
+            VALUES ($1, now())
+            ON CONFLICT (title_hash) DO NOTHING
+            """,
+            rows,
+        )
+        await conn.execute(
+            "DELETE FROM news_sent WHERE first_seen < now() - interval '%s days'" % NEWS_HISTORY_DAYS
+        )
+    except Exception as e:
+        print(f"[News] Failed to update news_sent: {e}")
+    finally:
+        await conn.close()
+
+
 # ── RSS helpers ───────────────────────────────────────────────────────────────
 
 def categorize(title: str, summary: str) -> str:
@@ -112,8 +202,23 @@ def categorize(title: str, summary: str) -> str:
     return "TECH"
 
 
+def _entry_published_dt(entry) -> datetime.datetime | None:
+    """Best-effort publish time for an entry, normalized to UTC. Returns None
+    if the feed doesn't supply one — callers should treat that as unknown
+    freshness, not as stale."""
+    struct = entry.get("published_parsed") or entry.get("updated_parsed")
+    if not struct:
+        return None
+    try:
+        return datetime.datetime.fromtimestamp(calendar.timegm(struct), tz=datetime.timezone.utc)
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
 async def fetch_rss(url: str, session: aiohttp.ClientSession) -> list[dict]:
-    """Fetch and parse one RSS feed, returning up to ENTRIES_PER_SOURCE items."""
+    """Fetch and parse one RSS feed, returning up to RAW_FETCH_LIMIT items that
+    fall within FRESHNESS_WINDOW_HOURS. Entries with no parseable date are kept
+    (can't tell if they're stale, so don't punish them for missing metadata)."""
     try:
         async with session.get(url, timeout=aiohttp.ClientTimeout(total=15)) as resp:
             text = await resp.text()
@@ -123,8 +228,10 @@ async def fetch_rss(url: str, session: aiohttp.ClientSession) -> list[dict]:
 
     feed  = feedparser.parse(text)
     items = []
+    now   = datetime.datetime.now(datetime.timezone.utc)
+    skipped_stale = 0
 
-    for entry in feed.entries[:ENTRIES_PER_SOURCE]:
+    for entry in feed.entries[:RAW_FETCH_LIMIT]:
         title   = entry.get("title", "").strip()
         link    = entry.get("link", "")
         summary = entry.get("summary", "")
@@ -132,18 +239,31 @@ async def fetch_rss(url: str, session: aiohttp.ClientSession) -> list[dict]:
         if not title or not link:
             continue
 
+        published_dt = _entry_published_dt(entry)
+        if published_dt is not None:
+            age_hours = (now - published_dt).total_seconds() / 3600
+            if age_hours > FRESHNESS_WINDOW_HOURS:
+                skipped_stale += 1
+                continue
+
         items.append({
-            "title":    title,
-            "link":     link,
-            "category": categorize(title, summary),
+            "title":        title,
+            "link":         link,
+            "category":     categorize(title, summary),
+            "published_dt": published_dt,
         })
 
-    print(f"[News] {url} → {len(items)} items")
+    print(f"[News] {url} → {len(items)} items ({skipped_stale} skipped as stale)")
     return items
 
 
-async def get_news_data() -> dict[str, list[dict]]:
-    """Fetch ALL sources concurrently and return deduplicated items grouped by category."""
+async def get_news_data(apply_history_filter: bool = False) -> dict[str, list[dict]]:
+    """
+    Fetch ALL sources concurrently, dedupe within this run, optionally drop
+    anything already shown in a previous digest (apply_history_filter — used
+    by the scheduled daily post, not $news), group by category, and sort each
+    category newest-first.
+    """
     async with aiohttp.ClientSession() as session:
         results = await asyncio.gather(
             *[fetch_rss(url, session) for url in TECH_SOURCES],
@@ -157,7 +277,7 @@ async def get_news_data() -> dict[str, list[dict]]:
         else:
             print(f"[News] Source raised exception: {r}")
 
-    # Deduplicate by title (case-insensitive)
+    # Deduplicate by title (case-insensitive) — within this run only.
     seen         = set()
     unique_items = []
     for item in all_items:
@@ -166,10 +286,19 @@ async def get_news_data() -> dict[str, list[dict]]:
             seen.add(key)
             unique_items.append(item)
 
+    if apply_history_filter:
+        unique_items = await filter_unsent(unique_items)
+
     # Group by category
     grouped: dict[str, list] = {}
     for item in unique_items:
         grouped.setdefault(item["category"], []).append(item)
+
+    # Newest first within each category. Items with no known publish time sort
+    # last rather than being dropped.
+    epoch_min = datetime.datetime.min.replace(tzinfo=datetime.timezone.utc)
+    for items in grouped.values():
+        items.sort(key=lambda i: i["published_dt"] or epoch_min, reverse=True)
 
     return grouped
 
@@ -237,6 +366,13 @@ def build_digest_embeds(
     return embeds
 
 
+def shown_items_from_grouped(grouped: dict[str, list]) -> list[dict]:
+    """The subset of items that actually made it into build_digest_embeds
+    (i.e. respecting the MAX_PER_CATEGORY cap) — this, not the full fetched
+    pool, is what should get marked as sent."""
+    return [item for items in grouped.values() for item in items[:MAX_PER_CATEGORY]]
+
+
 async def send_digest(send, embeds: list[discord.Embed], content: str | None = None) -> None:
     """
     Send embeds using as few messages as possible, only splitting into additional
@@ -293,7 +429,7 @@ class Updates(commands.Cog):
         if now.hour != POST_HOUR_UTC or now.minute != POST_MINUTE_UTC:
             return
 
-        grouped = await get_news_data()
+        grouped = await get_news_data(apply_history_filter=True)
         embeds  = build_digest_embeds(grouped)
         header  = f"**Daily Tech Digest** · {today_label()}"
 
@@ -310,6 +446,10 @@ class Updates(commands.Cog):
             print(f"[News] Sending digest to guild {guild_id_str} at {now.strftime('%H:%M UTC')}")
 
             await send_digest(channel.send, embeds, content=header)
+
+        # Mark whatever actually appeared in the digest as sent, once — not
+        # per guild, since it's the same content everywhere.
+        await mark_sent(shown_items_from_grouped(grouped))
 
     @daily_news.before_loop
     async def before_daily_news(self):
@@ -333,6 +473,10 @@ class Updates(commands.Cog):
             ))
             return
 
+        # Deliberately NOT using apply_history_filter here — $news is
+        # on-demand, so it always shows the freshest matching headlines
+        # regardless of what the scheduled digest already posted. Only the
+        # scheduled daily post dedupes against history.
         async with ctx.channel.typing():
             grouped = await get_news_data()
 
