@@ -17,6 +17,15 @@ import db
 POST_HOUR_UTC   = 12
 POST_MINUTE_UTC = 0
 
+# Admin notifications on errors — set ADMIN_USER_ID in Render env to get DMs
+ADMIN_USER_ID = os.getenv("ADMIN_USER_ID")
+if ADMIN_USER_ID:
+    try:
+        ADMIN_USER_ID = int(ADMIN_USER_ID)
+    except ValueError:
+        print("[News] WARNING: ADMIN_USER_ID is set but not a valid integer. Notifications disabled.")
+        ADMIN_USER_ID = None
+
 # Persistence file — stores {guild_id: channel_id} as strings
 NEWS_CHANNELS_FILE = "news_channels.json"
 
@@ -33,12 +42,8 @@ TECH_SOURCES = [
     "https://www.theverge.com/rss/index.xml",                # AI policy, big tech
     "https://feeds.feedburner.com/mitsmarterbusiness",       # MIT Technology Review
     "https://www.zdnet.com/news/rss.xml",                    # enterprise IT, security
-    "https://www.engadget.com/rss.xml",                      # broad tech, catches breaking
-                                                               # stories (leaks, DMCA fights, etc.)
-                                                               # general outlets otherwise miss
-    "https://www.bleepingcomputer.com/feed/",                 # dedicated infosec — breaches, CVEs,
-                                                               # malware; higher signal than
-                                                               # general-tech coverage of security
+    "https://www.engadget.com/rss.xml",                       # broad tech incl. breaking leaks/DMCA stories
+    "https://www.bleepingcomputer.com/feed/",                 # dedicated infosec (breaches, CVEs, malware)
 ]
 
 # How many raw entries to pull per source BEFORE freshness filtering. Kept wide
@@ -49,7 +54,7 @@ RAW_FETCH_LIMIT = 20
 # Drop anything older than this — prevents a slow-updating feed from serving
 # the same "latest" articles run after run. Applies to both the scheduled
 # digest and $news.
-FRESHNESS_WINDOW_HOURS = 48
+FRESHNESS_WINDOW_HOURS = 24
 
 # Max articles shown per category in the digest
 MAX_PER_CATEGORY = 10
@@ -413,10 +418,48 @@ class Updates(commands.Cog):
         self.news_channels: dict[str, int] = {**file_channels, **env_channels}
 
         self.last_sent_date: dict[str, datetime.date] = {}
+        
+        # Track last error notification per guild to avoid spam DMs.
+        # {guild_id_str: datetime} — only send a new DM if last one was 5+ mins ago.
+        self.last_error_notified: dict[str, datetime.datetime] = {}
+        
         self.daily_news.start()
 
     def cog_unload(self):
         self.daily_news.cancel()
+
+    async def notify_admin(self, guild_id: str, error_msg: str) -> None:
+        """
+        Send the admin a DM about an error in daily_news for a specific guild.
+        Includes cooldown (5 mins) per guild to avoid spam if errors repeat.
+        """
+        if not ADMIN_USER_ID:
+            return
+
+        now = datetime.datetime.now(datetime.timezone.utc)
+        last_notified = self.last_error_notified.get(guild_id)
+
+        # Skip if we notified about this guild in the last 5 minutes
+        if last_notified and (now - last_notified).total_seconds() < 300:
+            return
+
+        self.last_error_notified[guild_id] = now
+
+        try:
+            admin_user = await self.bot.fetch_user(ADMIN_USER_ID)
+            await admin_user.send(
+                f"**[KiwiBot News Error]**\n"
+                f"Guild ID: `{guild_id}`\n"
+                f"Time: <t:{int(now.timestamp())}:F>\n\n"
+                f"{error_msg}"
+            )
+            print(f"[News]  Admin notified of error in guild {guild_id}")
+        except discord.Forbidden:
+            print(f"[News]  Can't DM admin {ADMIN_USER_ID} — they may have DMs disabled")
+        except discord.NotFound:
+            print(f"[News]  Admin user {ADMIN_USER_ID} not found")
+        except Exception as e:
+            print(f"[News]  Failed to notify admin: {type(e).__name__}: {e}")
 
     # ── Scheduled daily post ──────────────────────────────────────────────────
 
@@ -445,10 +488,49 @@ class Updates(commands.Cog):
             self.last_sent_date[guild_id_str] = now.date()
             print(f"[News] Sending digest to guild {guild_id_str} at {now.strftime('%H:%M UTC')}")
 
-            await send_digest(channel.send, embeds, content=header)
+            try:
+                await send_digest(channel.send, embeds, content=header)
+            except discord.Forbidden:
+                error_msg = (
+                    f"**Missing Permissions**\n"
+                    f"Channel: <#{channel_id}>\n\n"
+                    f"Kiwi doesn't have permission to post messages. "
+                    f"Check the channel permissions and ensure Kiwi has `Send Messages` enabled."
+                )
+                await self.notify_admin(guild_id_str, error_msg)
+                print(f"[News] Missing permissions to post in {channel_id} (guild {guild_id_str})")
+            except discord.HTTPException as e:
+                # Covers 429 (rate limit), 500+ (server errors), network timeouts, etc.
+                error_msg = (
+                    f"**HTTP {e.status} Error**\n"
+                    f"Channel: <#{channel_id}>\n\n"
+                    f"```\n{str(e)[:200]}\n```\n\n"
+                )
+                if e.status == 429:
+                    error_msg += (
+                        " **Discord Rate Limit Hit**\n"
+                        "This guild's digest failed due to a 429 rate limit. "
+                        "This usually means Render's shared IP was flagged. Consider upgrading to paid Render or contacting Discord support."
+                    )
+                else:
+                    error_msg += f"Discord API returned status {e.status}. Check server status or try again later."
+                await self.notify_admin(guild_id_str, error_msg)
+                print(f"[News]  HTTP {e.status} error posting to guild {guild_id_str}: {e}")
+            except Exception as e:
+                # Covers asyncio errors, timeout errors, or anything else unexpected
+                error_msg = (
+                    f"**Unexpected Error**\n"
+                    f"Channel: <#{channel_id}>\n"
+                    f"Error Type: `{type(e).__name__}`\n\n"
+                    f"```\n{str(e)[:200]}\n```"
+                )
+                await self.notify_admin(guild_id_str, error_msg)
+                print(f"[News]  Error sending to guild {guild_id_str}: {type(e).__name__}: {e}")
 
         # Mark whatever actually appeared in the digest as sent, once — not
-        # per guild, since it's the same content everywhere.
+        # per guild, since it's the same content everywhere. Marked even if
+        # some guild sends failed — the dedup is about "what the digest tried
+        # to share", not "what every guild successfully received".
         await mark_sent(shown_items_from_grouped(grouped))
 
     @daily_news.before_loop
