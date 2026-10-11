@@ -22,9 +22,15 @@ intents.members = True
 
 
 def create_bot() -> commands.Bot:
+    proxy = os.getenv("DISCORD_PROXY") or os.getenv("HTTP_PROXY") or os.getenv("HTTPS_PROXY")
+    if proxy:
+        logger.info("Using proxy for Discord connection")
+        print("Using proxy for Discord connection")
+
     b = commands.Bot(
         command_prefix=["$", "!"],
-        intents=intents
+        intents=intents,
+        proxy=proxy
     )
 
     @b.event
