@@ -48,7 +48,18 @@ async def set_ctf_channel(guild_id: int, channel_id: int, notify_offline_india: 
         )
     finally:
         await conn.close()
-
+        
+async def remove_ctf_channel(guild_id: int) -> bool:
+    """Delete this guild's CTF config. Returns True if a row existed."""
+    conn = await connect()
+    try:
+        result = await conn.execute(
+            "DELETE FROM ctf_channels WHERE guild_id = $1", guild_id
+        )
+    finally:
+        await conn.close()
+    # asyncpg returns a status string like "DELETE 1" or "DELETE 0"
+    return int(result.split()[-1]) > 0
 
 # ── Everything below takes an existing connection — the scheduler opens   ──
 # ── one connection per run and passes it through, see ctf.py              ──

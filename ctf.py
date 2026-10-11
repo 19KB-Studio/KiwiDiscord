@@ -10,7 +10,8 @@ import filters
 import formatting
 
 CHECK_INTERVAL_HOURS = 6
-NOTIFY_WINDOW = (7, 10)  # days-out range for a first notification
+NOTIFY_WINDOW_DAYS = 10  # days-out range for a first notification
+NOTIFY_WINDOW = NOTIFY_WINDOW_DAYS
 UPCOMING_WINDOW_DAYS = 10  # for $ctfupcoming: 0 (starts later today) through this many days out
 MAX_EMBEDS_PER_MESSAGE = 10  # Discord hard cap per message
 
@@ -42,7 +43,7 @@ class CTFTracker(commands.Cog):
         now = datetime.datetime.now(datetime.timezone.utc)
         candidates = [
             e for e in events
-            if NOTIFY_WINDOW[0] <= filters.days_until_start(e, now) <= NOTIFY_WINDOW[1]
+            if 0 <= filters.days_until_start(e, now) <= NOTIFY_WINDOW_DAYS
             and (filters.is_open_online(e) or filters.is_offline_india(e))
         ]
 
@@ -112,12 +113,27 @@ class CTFTracker(commands.Cog):
         try:
             await db.set_ctf_channel(ctx.guild.id, ctx.channel.id, notify_india)
         except RuntimeError:
-            await ctx.send("❌ CTF tracker isn't configured yet (`DATABASE_URL` is not set). Ask the bot owner to set it up.")
+            await ctx.send("CTF tracker isn't configured yet (`DATABASE_URL` is not set). Ask the bot owner to set it up.")
             return
         await ctx.send(
-            f"✅ CTF notifications will be posted in {ctx.channel.mention}. "
+            f"CTF notifications will be posted in {ctx.channel.mention}. "
             f"Offline India events: {'included' if notify_india else 'excluded'}."
         )
+
+    @commands.command(name="removectfchannel")
+    @commands.has_permissions(administrator=True)
+    async def remove_ctf_channel(self, ctx: commands.Context):
+        """Stop CTF notifications for this server. Usage: $removectfchannel"""
+        try:
+            removed = await db.remove_ctf_channel(ctx.guild.id)
+        except RuntimeError:
+            await ctx.send("CTF tracker isn't configured yet (`DATABASE_URL` is not set).")
+            return
+
+        if not removed:
+            await ctx.send("No CTF channel is set for this server.")
+            return
+        await ctx.send("CTF notifications disabled for this server. Use `$setctfchannel` to re-enable.")
 
     @commands.command(name="ctfupcoming")
     async def ctf_upcoming(self, ctx: commands.Context):
