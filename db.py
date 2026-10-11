@@ -27,9 +27,10 @@ async def connect() -> asyncpg.Connection:
     handshake overhead for no benefit — what actually matters for Neon's
     scale-to-zero is not holding a connection open *between* runs.
     """
-    if not DATABASE_URL:
+    url = os.getenv("DATABASE_URL") or DATABASE_URL
+    if not url:
         raise RuntimeError("DATABASE_URL is not set")
-    return await asyncpg.connect(DATABASE_URL)
+    return await asyncpg.connect(url)
 
 
 # ── Channel config (low frequency, self-contained) ───────────────────────

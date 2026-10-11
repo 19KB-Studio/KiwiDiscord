@@ -143,7 +143,8 @@ async def filter_unsent(items: list[dict]) -> list[dict]:
     """Drop items whose title was already posted in a recent digest. If the DB
     isn't configured or the check fails, fail open and return items unchanged —
     a missing dedup check is better than a broken digest."""
-    if not db.DATABASE_URL or not items:
+    db_url = os.getenv("DATABASE_URL") or db.DATABASE_URL
+    if not db_url or not items:
         return items
 
     hashes = [_title_hash(i["title"]) for i in items]
@@ -170,7 +171,8 @@ async def filter_unsent(items: list[dict]) -> list[dict]:
 async def mark_sent(items: list[dict]) -> None:
     """Record headlines actually shown in a digest so they aren't repeated.
     Also prunes entries older than NEWS_HISTORY_DAYS on the same connection."""
-    if not db.DATABASE_URL or not items:
+    db_url = os.getenv("DATABASE_URL") or db.DATABASE_URL
+    if not db_url or not items:
         return
 
     rows = [(_title_hash(i["title"]),) for i in items]
@@ -189,7 +191,7 @@ async def mark_sent(items: list[dict]) -> None:
             rows,
         )
         await conn.execute(
-            "DELETE FROM news_sent WHERE first_seen < now() - interval '%s days'" % NEWS_HISTORY_DAYS
+            f"DELETE FROM news_sent WHERE first_seen < now() - interval '{int(NEWS_HISTORY_DAYS)} days'"
         )
     except Exception as e:
         print(f"[News] Failed to update news_sent: {e}")
@@ -469,7 +471,15 @@ class Updates(commands.Cog):
             return
 
         now = datetime.datetime.now(datetime.timezone.utc)
-        if now.hour != POST_HOUR_UTC or now.minute != POST_MINUTE_UTC:
+        target_time = datetime.time(POST_HOUR_UTC, POST_MINUTE_UTC)
+        if now.time() < target_time:
+            return
+
+        pending_guilds = [
+            gid for gid in self.news_channels
+            if self.last_sent_date.get(gid) != now.date()
+        ]
+        if not pending_guilds:
             return
 
         grouped = await get_news_data(apply_history_filter=True)
@@ -574,6 +584,7 @@ class Updates(commands.Cog):
     # ── $setnewschannel ───────────────────────────────────────────────────────
 
     @commands.command(name="setnewschannel")
+    @commands.guild_only()
     @commands.has_permissions(administrator=True)
     async def set_news_channel(self, ctx: commands.Context):
         """Set this channel as the daily news channel for this server. Usage: $setnewschannel"""
@@ -597,6 +608,7 @@ class Updates(commands.Cog):
     # ── $removenewschannel ────────────────────────────────────────────────────
 
     @commands.command(name="removenewschannel")
+    @commands.guild_only()
     @commands.has_permissions(administrator=True)
     async def remove_news_channel(self, ctx: commands.Context):
         """Stop daily news posts for this server only. Usage: $removenewschannel"""

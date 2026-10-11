@@ -3,17 +3,17 @@ import discord
 
 
 def build_event_embed(event: dict, days_out: int, live: bool = False) -> discord.Embed:
-    kind = "🌐 Online" if not event["onsite"] else f"📍 Onsite — {event['location']}"
+    kind = "Online" if not event["onsite"] else f"Onsite — {event['location']}"
 
     if live:
-        status = f"🔴 **LIVE NOW** — ends <t:{int(event['finish_time'].timestamp())}:R>"
+        status = f"**LIVE NOW** — ends <t:{int(event['finish_time'].timestamp())}:R>"
         color = discord.Color.red()
     else:
         status = f"Starts in **{days_out} day{'s' if days_out != 1 else ''}**"
         color = discord.Color.green()
 
     embed = discord.Embed(
-        title=f"🚩 {event['name']}",
+        title=event["name"],
         url=event["ctftime_url"],
         description=status,
         color=color,

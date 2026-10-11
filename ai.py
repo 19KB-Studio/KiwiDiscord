@@ -105,11 +105,12 @@ async def search_web(query: str) -> list[dict] | None:
     or missing key so callers can distinguish "no search happened" from
     "search happened but found nothing".
     """
-    if not TAVILY_API_KEY:
+    tavily_key = os.getenv("TAVILY_API_KEY") or TAVILY_API_KEY
+    if not tavily_key:
         return None
 
     payload = {
-        "api_key": TAVILY_API_KEY,
+        "api_key": tavily_key,
         "query": query,
         "search_depth": "basic",
         "max_results": TAVILY_MAX_RESULTS,
@@ -152,15 +153,22 @@ def format_search_context(results: list[dict]) -> str:
 # ── OpenRouter helper with retry + timeout ───────────────────────────────────
 
 async def query_openrouter(messages: list) -> str | None:
-    if not OPENROUTER_API_KEY:
+    api_key = os.getenv("OPENROUTER_API_KEY") or OPENROUTER_API_KEY
+    if not api_key:
         print("[OpenRouter] OPENROUTER_API_KEY is not set — skipping request.")
         return None
 
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+        "HTTP-Referer": "https://github.com/19KB-Studio/KiwiDiscord",
+        "X-Title": "kiwiBot",
+    }
     payload = {"model": OPENROUTER_MODEL, "messages": messages}
 
     for attempt in range(1, MAX_RETRIES + 1):
         try:
-            async with aiohttp.ClientSession(headers=OPENROUTER_HEADERS) as session:
+            async with aiohttp.ClientSession(headers=headers) as session:
                 async with session.post(
                     OPENROUTER_URL,
                     json=payload,
@@ -237,7 +245,7 @@ class AI(commands.Cog):
     @commands.command(name="ai", aliases=["ask"])
     async def ask_ai(self, ctx: commands.Context, *, question: str):
         """Ask the AI a question (with live web search). Usage: $ai <question> (or $ask)"""
-        server  = str(ctx.guild.id)
+        server  = str(ctx.guild.id) if ctx.guild else "dm"
         channel = str(ctx.channel.id)
 
         async with ctx.channel.typing():
@@ -245,20 +253,20 @@ class AI(commands.Cog):
 
         if content is None:
             await ctx.send(
-                "⚠️No response after retries. This is usually the free-tier "
+                "No response after retries. This is usually the free-tier "
                 "daily rate limit (resets daily) or a temporary provider issue — "
                 "please try again in a bit."
             )
             return
 
-        await send_chunked(ctx, append_sources(f"🤖 **AI:**\n{content}", search_results))
+        await send_chunked(ctx, append_sources(f"**AI:**\n{content}", search_results))
 
     # ── $clear_context ────────────────────────────────────────────────────────
 
     @commands.command(name="clear_context")
     async def clear_context(self, ctx: commands.Context):
         """Clear conversation history for this channel. Usage: $clear_context"""
-        server  = str(ctx.guild.id)
+        server  = str(ctx.guild.id) if ctx.guild else "dm"
         channel = str(ctx.channel.id)
         if server in conversation_context and channel in conversation_context[server]:
             conversation_context[server][channel] = []
@@ -278,7 +286,7 @@ class AI(commands.Cog):
         server  = str(message.guild.id)
         channel = str(message.channel.id)
 
-        content_clean = message.content.replace(f"<@{self.bot.user.id}>", "").strip()
+        content_clean = message.content.replace(f"<@!{self.bot.user.id}>", "").replace(f"<@{self.bot.user.id}>", "").strip()
         if not content_clean:
             await message.channel.send(
                 "Hey! How can I help? Try `$ai` with a question."
@@ -290,7 +298,7 @@ class AI(commands.Cog):
 
         if response_content is None:
             await message.channel.send(
-                "⚠️I error occurred (timeout/rate-limit). Try again in a moment."
+                "An error occurred (timeout/rate-limit). Try again in a moment."
             )
             return
 

@@ -1,5 +1,6 @@
 # ctf.py
 import datetime
+import os
 
 import discord
 from discord.ext import commands, tasks
@@ -19,7 +20,9 @@ MAX_EMBEDS_PER_MESSAGE = 10  # Discord hard cap per message
 class CTFTracker(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
-        if db.DATABASE_URL:
+        db_url = os.getenv("DATABASE_URL") or db.DATABASE_URL
+        if db_url:
+            db.DATABASE_URL = db_url
             self.check_ctf_events.start()
         else:
             print(
@@ -103,6 +106,7 @@ class CTFTracker(commands.Cog):
     # ── Commands ──────────────────────────────────────────────────────────
 
     @commands.command(name="setctfchannel")
+    @commands.guild_only()
     @commands.has_permissions(administrator=True)
     async def set_ctf_channel(self, ctx: commands.Context, offline_india: str = "yes"):
         """
@@ -121,6 +125,7 @@ class CTFTracker(commands.Cog):
         )
 
     @commands.command(name="removectfchannel")
+    @commands.guild_only()
     @commands.has_permissions(administrator=True)
     async def remove_ctf_channel(self, ctx: commands.Context):
         """Stop CTF notifications for this server. Usage: $removectfchannel"""

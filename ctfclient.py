@@ -43,7 +43,7 @@ async def fetch_upcoming_events(limit: int = 100, days_back: int = 3, days_forwa
                 if resp.status != 200:
                     print(f"[CTFtime] Unexpected status {resp.status}")
                     return []
-                raw = await resp.json()
+                raw = await resp.json(content_type=None)
         except Exception as e:
             print(f"[CTFtime] Fetch failed: {e}")
             return []

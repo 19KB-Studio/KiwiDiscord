@@ -42,7 +42,7 @@ def is_prime(n: int) -> bool:
 def generate_prime(bits: int = 512) -> int:
     """Generate a random prime of given bit length."""
     while True:
-        n = random.getrandbits(bits) | (1 << bits - 1) | 1
+        n = random.getrandbits(bits) | (1 << (bits - 1)) | 1
         if is_prime(n):
             return n
 
@@ -288,7 +288,7 @@ class Crypto(commands.Cog):
                 result = rot_cipher(text, shift)
 
             except ValueError:
-                await ctx.send("❌ Usage: `$encode rot<N> <text>`")
+                await ctx.send("Usage: `$encode rot<N> <text>`")
                 return
 
         elif method == "xor":
@@ -296,19 +296,19 @@ class Crypto(commands.Cog):
             parts = text.split(" ", 1)
 
             if len(parts) < 2:
-                await ctx.send("❌ Usage: `$encode xor <key> <text>`")
+                await ctx.send("Usage: `$encode xor <key> <text>`")
                 return
 
             try:
                 key = int(parts[0])
             except ValueError:
-                await ctx.send("❌ XOR key must be an integer.")
+                await ctx.send("XOR key must be an integer.")
                 return
 
             result = xor_cipher(parts[1], key)
 
         else:
-            await ctx.send("❌ Supported methods: base64, hex, url, rot<N>, xor")
+            await ctx.send("Supported methods: base64, hex, url, rot<N>, xor")
             return
 
         await ctx.send(f"**{method.upper()}** → `{result}`")
@@ -324,7 +324,7 @@ class Crypto(commands.Cog):
             steps = multilayer_decode(method_or_text)
 
             if not steps:
-                await ctx.send("❌ No decoding method succeeded.")
+                await ctx.send("No decoding method succeeded.")
                 return
 
             lines = ["**Auto Multi-layer Decoding:**"] + steps
@@ -350,7 +350,7 @@ class Crypto(commands.Cog):
                 decoded = rot_cipher(text, -shift)
 
             except ValueError:
-                await ctx.send("❌ Usage: `$decode rot<N> <text>`")
+                await ctx.send("Usage: `$decode rot<N> <text>`")
                 return
 
         elif method == "xor":
@@ -358,23 +358,23 @@ class Crypto(commands.Cog):
             parts = text.split(" ", 1)
 
             if len(parts) < 2:
-                await ctx.send("❌ Usage: `$decode xor <key> <text>`")
+                await ctx.send("Usage: `$decode xor <key> <text>`")
                 return
 
             try:
                 key = int(parts[0])
             except ValueError:
-                await ctx.send("❌ XOR key must be an integer.")
+                await ctx.send("XOR key must be an integer.")
                 return
 
             decoded = xor_cipher(parts[1], key)
 
         else:
-            await ctx.send("❌ Supported methods: base64, hex, url, rot<N>, xor")
+            await ctx.send("Supported methods: base64, hex, url, rot<N>, xor")
             return
 
         if not decoded:
-            await ctx.send("❌ Invalid input or decoding failed.")
+            await ctx.send("Invalid input or decoding failed.")
             return
 
         await ctx.send(f"**{method.upper()}** → `{decoded}`")
@@ -388,7 +388,7 @@ class Crypto(commands.Cog):
         Usage: $rsagen [bits]   (256, 512, or 1024 — default 512)
         """
         if bits not in (256, 512, 1024):
-            await ctx.send("❌ Supported key sizes: `256`, `512`, `1024`.")
+            await ctx.send("Supported key sizes: `256`, `512`, `1024`.")
             return
 
         async with ctx.channel.typing():
@@ -398,11 +398,11 @@ class Crypto(commands.Cog):
         d, _ = keypair["private"]
 
         lines = [
-            f"🔑 **RSA Keypair Generated ({bits}-bit)**",
+            f"**RSA Keypair Generated ({bits}-bit)**",
             format_key("Public Key", e, n),
             format_key("Private Key", d, n),
             "",
-            "⚠️ For learning/demo purposes only — not secure for real-world use.",
+            "For learning/demo purposes only — not secure for real-world use.",
         ]
         await ctx.send("\n".join(lines))
 
@@ -413,27 +413,27 @@ class Crypto(commands.Cog):
         Usage: $rsaencrypt <e> <n> <message>
         Output is space-separated integers — one per character.
         Arguments:
-            d          Private exponent of the RSA key.
-            n          Modulus of the RSA key (same value used during encryption).
-            ciphertext Space-separated integers representing the encrypted message blocks.
+            e          Public exponent of the RSA key.
+            n          Modulus of the RSA key.
+            message    The message string to encrypt.
         """
         if len(message) > 100:
-            await ctx.send("❌ Message too long. Keep it under 100 characters for RSA.")
+            await ctx.send("Message too long. Keep it under 100 characters for RSA.")
             return
 
         if any(ord(c) >= n for c in message):
-            await ctx.send("❌ Your `n` value is too small for this message. Use a larger keypair.")
+            await ctx.send("Your `n` value is too small for this message. Use a larger keypair.")
             return
 
         async with ctx.channel.typing():
             ciphertext = await asyncio.to_thread(rsa_encrypt, message, e, n)
 
         cipher_str = " ".join(str(x) for x in ciphertext)
-        result     = f"🔒 **RSA Encrypted:**\n`{cipher_str}`"
+        result     = f"**RSA Encrypted:**\n`{cipher_str}`"
 
         if len(result) > 1990:
             import io
-            await ctx.send("🔒 **RSA Encrypted (output too large, sent as file):**")
+            await ctx.send("**RSA Encrypted (output too large, sent as file):**")
             file = discord.File(io.BytesIO(cipher_str.encode()), filename="rsa_ciphertext.txt")
             await ctx.send(file=file)
         else:
@@ -452,17 +452,17 @@ class Crypto(commands.Cog):
         try:
             cipher_ints = [int(x) for x in ciphertext.strip().split()]
         except ValueError:
-            await ctx.send("❌ Ciphertext must be space-separated integers. Example:\n`$rsadecrypt <d> <n> 2081 2367 3216 3216 2324`")
+            await ctx.send("Ciphertext must be space-separated integers. Example:\n`$rsadecrypt <d> <n> 2081 2367 3216 3216 2324`")
             return
 
         try:
             async with ctx.channel.typing():
                 plaintext = await asyncio.to_thread(rsa_decrypt, cipher_ints, d, n)
         except Exception:
-            await ctx.send("❌ Decryption failed. Double-check your `d`, `n`, and ciphertext values.")
+            await ctx.send("Decryption failed. Double-check your `d`, `n`, and ciphertext values.")
             return
 
-        await ctx.send(f"🔓 **RSA Decrypted:**\n`{plaintext}`")
+        await ctx.send(f"**RSA Decrypted:**\n`{plaintext}`")
 
     @commands.command(name="rsasolve")
     async def rsa_solve(self, ctx: commands.Context, p: int, q: int, e: int, *, message: str = None):
@@ -472,23 +472,23 @@ class Crypto(commands.Cog):
         Example: $rsasolve 61 53 17 HELLO
         """
         if not (is_prime(p) and is_prime(q)):
-            await ctx.send("❌ Both `p` and `q` must be prime numbers.")
+            await ctx.send("Both `p` and `q` must be prime numbers.")
             return
         if p == q:
-            await ctx.send("❌ `p` and `q` must be different primes.")
+            await ctx.send("`p` and `q` must be different primes.")
             return
 
         n   = p * q
         phi = (p - 1) * (q - 1)
 
         if gcd(e, phi) != 1:
-            await ctx.send(f"❌ `e = {e}` is not coprime with φ(n) = {phi}. Choose a different `e`.")
+            await ctx.send(f"`e = {e}` is not coprime with φ(n) = {phi}. Choose a different `e`.")
             return
 
         d = mod_inverse(e, phi)
 
         lines = [
-            "🧮 **RSA Problem — Step by Step**",
+            "**RSA Problem — Step by Step**",
             "```",
             f"p          = {p}",
             f"q          = {q}",
@@ -503,7 +503,7 @@ class Crypto(commands.Cog):
 
         if message:
             if any(ord(c) >= n for c in message):
-                lines.append("\n⚠️ Message characters exceed `n` — encryption skipped. Use larger primes.")
+                lines.append("\nMessage characters exceed `n` — encryption skipped. Use larger primes.")
             else:
                 cipher    = rsa_encrypt(message, e, n)
                 decrypted = rsa_decrypt(cipher, d, n)
@@ -511,8 +511,8 @@ class Crypto(commands.Cog):
 
                 lines += [
                     "",
-                    f"🔒 **Encrypted:** `{cipher_str}`",
-                    f"🔓 **Decrypted:** `{decrypted}`",
+                    f"**Encrypted:** `{cipher_str}`",
+                    f"**Decrypted:** `{decrypted}`",
                     "",
                     "**Character breakdown:**",
                     "```",
@@ -529,7 +529,7 @@ class Crypto(commands.Cog):
     async def rsa_info(self, ctx: commands.Context):
         """Explain how RSA works with a step-by-step embed. Usage: $rsainfo"""
         embed = discord.Embed(
-            title="🔐 How RSA Works",
+            title="How RSA Works",
             color=discord.Color.blue()
         )
         embed.add_field(name="1. Key Generation", value=(
@@ -539,17 +539,17 @@ class Crypto(commands.Cog):
             "Choose **e** coprime to φ(n) — usually `65537`\n"
             "Compute **d = e⁻¹ mod φ(n)**"
         ), inline=False)
-        embed.add_field(name="2. Encryption  🔒", value=(
+        embed.add_field(name="2. Encryption", value=(
             "Public key = **(e, n)**\n"
             "Formula: **C = Mᵉ mod n**\n"
             "M = ASCII value of each character"
         ), inline=False)
-        embed.add_field(name="3. Decryption  🔓", value=(
+        embed.add_field(name="3. Decryption", value=(
             "Private key = **(d, n)**\n"
             "Formula: **M = Cᵈ mod n**\n"
             "Result is converted back to characters"
         ), inline=False)
-        embed.add_field(name="📌 Bot Commands", value=(
+        embed.add_field(name="Bot Commands", value=(
             "`$rsagen [bits]` — Generate a keypair (256/512/1024)\n"
             "`$rsaencrypt <e> <n> <message>` — Encrypt a message\n"
             "`$rsadecrypt <d> <n> <integers>` — Decrypt ciphertext\n"
